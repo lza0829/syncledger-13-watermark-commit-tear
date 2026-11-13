@@ -246,11 +246,15 @@ def run_reconcile(
             left_max = max_watermark(left_all, pair["left_wm_field"])
             right_max = max_watermark(right_all, pair["right_wm_field"])
 
+            # Regression on EITHER side rejects the whole run. A per-side
+            # ``and`` here would let one side roll back while the other moves
+            # forward, and then push that side's watermark backwards.
             regressions = []
-            if left_max < old_left and right_max < old_right:
+            if left_max < old_left:
                 regressions.append(
                     f"左端水位回退（已记 {_wm_display(old_left)}，源端现最大 {_wm_display(left_max)}）"
                 )
+            if right_max < old_right:
                 regressions.append(
                     f"右端水位回退（已记 {_wm_display(old_right)}，源端现最大 {_wm_display(right_max)}）"
                 )
@@ -283,11 +287,15 @@ def run_reconcile(
             )
 
             finished = _now()
+            # Both watermarks can only move forward; for a non-regressing run
+            # this equals the observed max on each side.
+            new_left_wm = max(old_left or "", left_max or "")
+            new_right_wm = max(old_right or "", right_max or "")
             for diff in result["diffs"]:
                 batch_repo.insert_diff(conn, batch_id=batch_id, pair_id=pair_id, diff=diff, created_at=finished)
             reason = (
-                f"水位前进成功：左 {_wm_display(old_left)}→{_wm_display(left_max)}，"
-                f"右 {_wm_display(old_right)}→{_wm_display(right_max)}；"
+                f"水位前进成功：左 {_wm_display(old_left)}→{_wm_display(new_left_wm)}，"
+                f"右 {_wm_display(old_right)}→{_wm_display(new_right_wm)}；"
                 f"增量抽取 左{len(left_inc)}行/右{len(right_inc)}行"
             )
             batch_repo.update_batch(
@@ -295,8 +303,8 @@ def run_reconcile(
                 batch_id,
                 status="completed",
                 reason=reason,
-                new_left_wm=left_max,
-                new_right_wm=right_max,
+                new_left_wm=new_left_wm,
+                new_right_wm=new_right_wm,
                 left_max_wm_seen=left_max,
                 right_max_wm_seen=right_max,
                 left_rows=result["counts"]["left_rows"],
@@ -308,12 +316,13 @@ def run_reconcile(
                 diff_total=result["counts"]["diff_total"],
                 finished_at=finished,
             )
-            conn.commit()
+            # Diffs + batch completion + BOTH watermarks land in one commit:
+            # either all of them advance together or none do.
             wm_repo.advance(
                 conn,
                 pair_id,
-                left_watermark=left_max,
-                right_watermark=right_max,
+                left_watermark=new_left_wm,
+                right_watermark=new_right_wm,
                 batch_id=batch_id,
                 now=finished,
             )
@@ -403,6 +412,17 @@ def audit_summary(batch_id: int) -> dict[str, Any]:
                 max(batch["old_right_wm"] or "", batch["right_max_wm_seen"] or ""),
                 batch["new_right_wm"] or "",
             )
+            # Monotonicity: a completed batch may never pull a side backwards.
+            add(
+                "新左水位不倒退",
+                True,
+                (batch["new_left_wm"] or "") >= (batch["old_left_wm"] or ""),
+            )
+            add(
+                "新右水位不倒退",
+                True,
+                (batch["new_right_wm"] or "") >= (batch["old_right_wm"] or ""),
+            )
             latest_done = conn.execute(
                 """
                 SELECT id FROM reconcile_batches
@@ -419,9 +439,23 @@ def audit_summary(batch_id: int) -> dict[str, Any]:
             add("未落差异行", 0, diff_rows)
             add("左水位未动（新=旧）", batch["old_left_wm"], batch["new_left_wm"])
             add("右水位未动（新=旧）", batch["old_right_wm"], batch["new_right_wm"])
-            if state:
+            latest_batch = conn.execute(
+                "SELECT id FROM reconcile_batches WHERE pair_id=? ORDER BY id DESC LIMIT 1",
+                (batch["pair_id"],),
+            ).fetchone()
+            # Only the pair's newest batch can be compared against the live
+            # watermark row; an older rejected batch has since been superseded
+            # by a later completed run (the table legitimately moved on).
+            if state and latest_batch and latest_batch["id"] == batch_id:
                 add("水位表左水位 = 批前旧值", batch["old_left_wm"], state["left_watermark"])
                 add("水位表右水位 = 批前旧值", batch["old_right_wm"], state["right_watermark"])
+                # The rejected batch must never be recorded as the pair's
+                # watermark-advancing batch (that would be a commit tear).
+                add(
+                    "水位表更新批次不是本批",
+                    True,
+                    state["updated_by_batch"] != batch_id,
+                )
 
         return {
             "batch": batch,

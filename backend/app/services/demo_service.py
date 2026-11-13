@@ -111,21 +111,32 @@ def _restore_fixture(name: str) -> None:
     shutil.copyfile(BASELINE_FIXTURES_DIR / name, FIXTURES_DIR / name)
 
 
-def regress_fixtures(pair_code: str) -> dict[str, Any]:
+def regress_fixtures(pair_code: str, side: str = "both") -> dict[str, Any]:
     """Roll the pair's sources back to the baseline snapshot.
 
-    After a successful run the recorded watermarks sit ahead of the baseline
-    maxima, so the next run observes a regression and applies the fixed
-    policy (reject the whole run, no diffs, watermarks untouched).
+    ``side`` may be ``both`` (default), ``left`` or ``right``. The single-side
+    variants exist to demonstrate the fixed policy for the most dangerous
+    case: one endpoint rolls back while the other has already moved forward. After a
+    successful run the recorded watermarks sit ahead of the baseline maxima,
+    so the next run observes a regression and applies the fixed policy (reject
+    the whole run, no diffs, watermarks untouched on BOTH sides).
     """
+    if side not in ("both", "left", "right"):
+        raise ValueError("side must be both|left|right")
     pair = _get_pair_or_raise(pair_code)
-    _restore_fixture(pair["left_fixture"])
-    _restore_fixture(pair["right_fixture"])
+    names = {
+        "both": [pair["left_fixture"], pair["right_fixture"]],
+        "left": [pair["left_fixture"]],
+        "right": [pair["right_fixture"]],
+    }[side]
+    for name in names:
+        _restore_fixture(name)
     left = _load(pair["left_fixture"])
     right = _load(pair["right_fixture"])
     return {
         "pair_code": pair_code,
-        "restored": [pair["left_fixture"], pair["right_fixture"]],
+        "side": side,
+        "restored": names,
         "left_max_wm": _max_wm(left, pair["left_wm_field"]),
         "right_max_wm": _max_wm(right, pair["right_wm_field"]),
     }

@@ -42,12 +42,23 @@ def advance(
     batch_id: int,
     now: str,
 ) -> None:
-    """Persist watermarks after a completed batch."""
-    conn.execute(
+    """Persist BOTH watermarks after a completed batch.
+
+    Deliberately the only watermark writer: there is no per-side update entry
+    point, so the two sides cannot tear apart. The caller runs this inside the
+    same transaction as the batch completion and its diff rows.
+    """
+    cur = conn.execute(
         """
         UPDATE pair_watermarks
-           SET left_watermark=?, updated_by_batch=?, updated_at=?
+           SET left_watermark=?, right_watermark=?, updated_by_batch=?, updated_at=?
          WHERE pair_id=?
         """,
-        (left_watermark, batch_id, now, pair_id),
+        (left_watermark, right_watermark, batch_id, now, pair_id),
     )
+    if cur.rowcount != 1:
+        # A silent no-op here would leave the batch report and the watermark
+        # table disagreeing; fail loudly so the whole transaction rolls back.
+        raise RuntimeError(
+            f"水位推进失败：pair_id={pair_id} 的水位行不存在或未更新（rowcount={cur.rowcount}）"
+        )

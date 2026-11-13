@@ -8,6 +8,7 @@ const pairId = ref(null)
 const note = ref('')
 const slowExtract = ref(false)
 const withMismatch = ref(false)
+const regressSide = ref('left')
 const last = ref(null)
 const demoMsg = ref('')
 const busy = ref(false)
@@ -70,8 +71,9 @@ async function demo(action) {
       const r = await postJSON(`/api/demo/advance/${code}?rows=2&mismatch=${withMismatch.value}`)
       demoMsg.value = `已给双端各追加 ${r.appended} 行（左最大水位 ${r.left_max_wm}，右最大水位 ${r.right_max_wm}），点「发起对账」看增量前进。`
     } else if (action === 'regress') {
-      const r = await postJSON(`/api/demo/regress/${code}`)
-      demoMsg.value = `源端已回滚到基线（左最大水位 ${r.left_max_wm}，右最大水位 ${r.right_max_wm}），再点「发起对账」将触发回退策略：整趟拒绝、水位不动。`
+      const r = await postJSON(`/api/demo/regress/${code}?side=${regressSide.value}`)
+      const sideLabel = { both: '双端', left: '仅左端', right: '仅右端' }[regressSide.value]
+      demoMsg.value = `源端${sideLabel}已回滚到基线（左最大水位 ${r.left_max_wm || '(空)'}，右最大水位 ${r.right_max_wm || '(空)'}），再点「发起对账」将触发回退策略：整趟拒绝、两侧水位都不动。`
     } else if (action === 'concurrent') {
       const body = { pair_id: Number(pairId.value), extract_delay_ms: 2000 }
       const [a, b] = await Promise.allSettled([postJSON('/api/reconcile', body), postJSON('/api/reconcile', body)])
@@ -137,12 +139,20 @@ onMounted(async () => {
           <input type="checkbox" v-model="withMismatch" /> 首行制造字段差
         </label>
         <button :disabled="busy || !pair" @click="demo('regress')">② 源端回滚到基线</button>
+        <label style="display:flex;gap:0.35rem;align-items:center">
+          回滚侧
+          <select v-model="regressSide" style="margin-left:0.25rem">
+            <option value="left">仅左端</option>
+            <option value="right">仅右端</option>
+            <option value="both">双端</option>
+          </select>
+        </label>
         <button :disabled="busy || !pair" @click="demo('concurrent')">③ 并发开跑测试</button>
         <button :disabled="busy" @click="demo('reset')">重置演示</button>
       </div>
       <p v-if="demoMsg" class="tag" style="margin-bottom:0">{{ demoMsg }}</p>
       <p class="muted" style="margin-bottom:0">
-        演示路径：先跑一趟建立水位 → ①追加增量后再跑（前进成功）→ ②回滚基线后再跑（回退触发整趟拒绝）→ ③同时开两趟（一趟完成、一趟并发拒绝）。
+        演示路径：先跑一趟建立水位 → ①追加增量后再跑（前进成功，左右水位一起前进）→ ②选「仅左端」回滚基线后再跑（单侧回退也整趟拒绝、两侧水位都不动）→ ③同时开两趟（一趟完成、一趟并发拒绝）。
       </p>
     </div>
 

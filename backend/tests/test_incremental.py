@@ -80,23 +80,101 @@ def test_incremental_run_after_advance_aligns_only_new_rows():
     batch = svc.run_reconcile(pid)
     assert batch["status"] == "completed"
     assert batch["left_rows"] == 2
+    assert batch["right_rows"] == 2
     assert batch["new_left_wm"] > batch["old_left_wm"]
     wm = _watermarks(pid)
+    # BOTH sides must advance in the same batch — the historical bug left the
+    # right side at its old value (or empty), forcing a full re-extract next run.
     assert wm["left_watermark"] == batch["new_left_wm"]
+    assert wm["right_watermark"] == batch["new_right_wm"]
+    assert wm["right_watermark"] != ""
+    assert wm["updated_by_batch"] == batch["id"]
+    # Next run over an unchanged source must extract nothing on either side.
+    again = svc.run_reconcile(pid)
+    assert again["status"] == "completed"
+    assert again["left_rows"] == 0 and again["right_rows"] == 0
+    assert again["new_left_wm"] == again["old_left_wm"]
+    assert again["new_right_wm"] == again["old_right_wm"]
 
 
-def test_regression_rejects_whole_run_no_diffs_watermarks_untouched():
+def _advance_then_regress(side: str) -> tuple[dict, dict, dict]:
     pid = _pair_id(INVENTORY)
     svc.run_reconcile(pid)
-    demo_service.advance_fixtures(INVENTORY, rows=1)
+    demo_service.advance_fixtures(INVENTORY, rows=2, mismatch=True)
     svc.run_reconcile(pid)
-    before = _watermarks(pid)
-    demo_service.regress_fixtures(INVENTORY)
+    before = dict(_watermarks(pid))
+    demo_service.regress_fixtures(INVENTORY, side=side)
     batch = svc.run_reconcile(pid)
-    assert batch["status"] in {"rejected_regression", "completed"}
     after = _watermarks(pid)
-    assert after["updated_by_batch"] is not None or batch["status"] == "rejected_regression"
-    assert before["left_watermark"] != "" or True
+    return before, batch, after
+
+
+def test_regression_both_sides_rejects_whole_run_no_diffs_watermarks_untouched():
+    before, batch, after = _advance_then_regress("both")
+    assert before["left_watermark"] and before["right_watermark"]
+    assert batch["status"] == "rejected_regression"
+    assert "整趟拒绝" in batch["reason"]
+    assert svc.list_diffs(batch_id=batch["id"]) == []
+    assert batch["new_left_wm"] == batch["old_left_wm"]
+    assert batch["new_right_wm"] == batch["old_right_wm"]
+    assert after == before  # neither watermark row field moved
+
+
+def test_left_only_rollback_rejects_whole_run_and_right_watermark_does_not_move():
+    before, batch, after = _advance_then_regress("left")
+    assert batch["status"] == "rejected_regression"
+    assert "左端水位回退" in batch["reason"]
+    assert "右端水位回退" not in batch["reason"]
+    assert svc.list_diffs(batch_id=batch["id"]) == []
+    # The right side had NOT rolled back, yet the whole run is rejected and
+    # the right watermark must stay exactly where it was (not move at all).
+    assert after["right_watermark"] == before["right_watermark"]
+    assert after["left_watermark"] == before["left_watermark"]
+    assert after["updated_by_batch"] == before["updated_by_batch"]
+    assert batch["new_left_wm"] == batch["old_left_wm"] == before["left_watermark"]
+    assert batch["new_right_wm"] == batch["old_right_wm"] == before["right_watermark"]
+    # Audit must confirm zero diffs, both sides untouched, batch not recorded
+    # as the watermark-advancing batch.
+    audit = svc.audit_summary(batch["id"])
+    assert audit["checks_ok"], audit["checks"]
+
+
+def test_right_only_rollback_rejects_whole_run_and_left_watermark_does_not_move():
+    before, batch, after = _advance_then_regress("right")
+    assert batch["status"] == "rejected_regression"
+    assert "右端水位回退" in batch["reason"]
+    assert "左端水位回退" not in batch["reason"]
+    assert svc.list_diffs(batch_id=batch["id"]) == []
+    assert after["left_watermark"] == before["left_watermark"]
+    assert after["right_watermark"] == before["right_watermark"]
+    assert after["updated_by_batch"] == before["updated_by_batch"]
+    audit = svc.audit_summary(batch["id"])
+    assert audit["checks_ok"], audit["checks"]
+
+
+def test_completed_batch_watermarks_and_report_commit_together(monkeypatch):
+    """A failure after the batch row is written must not leave either watermark
+    ahead of a batch that never completed (commit tear)."""
+    pid = _pair_id(INVENTORY)
+
+    import app.repositories.watermarks as wm_repo
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("watermark write exploded")
+
+    monkeypatch.setattr(wm_repo, "advance", boom)
+    with pytest.raises(RuntimeError):
+        svc.run_reconcile(pid)
+    batch = _batches(pid)[0]
+    assert batch["status"] == "failed"
+    wm = _watermarks(pid)
+    assert wm["left_watermark"] == "" and wm["right_watermark"] == ""
+    assert wm["updated_by_batch"] is None
+    assert svc.list_diffs(batch_id=batch["id"]) == []
+    monkeypatch.undo()
+    ok = svc.run_reconcile(pid)
+    assert ok["status"] == "completed"
+    assert _watermarks(pid)["updated_by_batch"] == ok["id"]
 
 
 def test_concurrent_start_is_rejected_with_reason():
